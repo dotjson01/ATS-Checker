@@ -1,0 +1,22 @@
+[server]
+maxUploadSize = 10
+enableCORS = true
+enableXsrfProtection = true
+maxMessageSize = 200
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+primaryColor = "#4d648d"
+backgroundColor = "#1e1e1e"  # Charcoal black background
+secondaryBackgroundColor = "#2d2d2d"  # Slightly lighter charcoal for secondary elements
+textColor = "#f0f0f0"  # Light text for dark background
+font = "sans serif"
+
+[runner]
+fastReruns = true
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = false

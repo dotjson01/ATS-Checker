@@ -1,20 +1,66 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import os
+import time
+import threading
 from datetime import datetime
 from dotenv import load_dotenv
 import google.generativeai as genai
 from PyPDF2 import PdfReader
+
+# Timeout handler for API calls
+class TimeoutException(Exception):
+    pass
+
+def timeout_handler(seconds, callback, *args, **kwargs):
+    """Run a function with a timeout"""
+    result = [None]
+    error = [None]
+    completed = [False]
+
+    def target():
+        try:
+            result[0] = callback(*args, **kwargs)
+            completed[0] = True
+        except Exception as e:
+            error[0] = e
+
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(seconds)
+
+    if completed[0]:
+        if error[0] is not None:
+            raise error[0]
+        return result[0]
+    else:
+        raise TimeoutException(f"Function call timed out after {seconds} seconds")
 
 # Load environment variables and configure API
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 model = genai.GenerativeModel("gemini-1.5-flash")
 
-# Function to get Gemini output
+# Function to get Gemini output with caching and timeout
+@st.cache_data(ttl=3600, show_spinner=False)  # Cache for 1 hour
 def get_gemini_output(pdf_text, prompt):
-    response = model.generate_content([pdf_text, prompt])
-    return response.text
+    try:
+        with st.spinner("Analyzing your resume... This may take a moment."):
+            # Define the API call function
+            def api_call():
+                return model.generate_content([pdf_text, prompt])
+
+            # Call with timeout (60 seconds)
+            try:
+                response = timeout_handler(60, api_call)
+                return response.text
+            except TimeoutException:
+                st.error("Analysis is taking longer than expected. Please try again or use a shorter resume.")
+                return "Analysis timed out. Please try again with a shorter resume or simpler job description."
+    except Exception as e:
+        st.error(f"Error connecting to Gemini API: {str(e)}")
+        return "Error analyzing resume. Please try again later."
 
 # Function to get ATS score from analysis
 def extract_ats_score(analysis_text):
@@ -22,7 +68,19 @@ def extract_ats_score(analysis_text):
         # Look for patterns like "ATS SCORE: 75.5" or "ATS Score: 75.5/100"
         import re
 
-        # First, look for the exact ATS SCORE line in the analysis
+        # First, check for HTML h2 tag format (from our custom formatting)
+        html_pattern = r'<h2[^>]*>ATS SCORE</h2>\s*(\d+\.?\d*)'
+        html_match = re.search(html_pattern, analysis_text, re.IGNORECASE)
+
+        if html_match:
+            score_value = float(html_match.group(1))
+            print(f"Found score from HTML h2 tag: {score_value}")
+            return {
+                "value": score_value,
+                "display": f"{score_value}/100"
+            }
+
+        # Next, look for the exact ATS SCORE line in the analysis
         # This is the most reliable way to get the exact score as shown in the analysis
         score_line_pattern = r"(?:^|\n)(?:.*?)ATS\s+SCORE:?\s*(.*?)(?:\n|$)"
         score_line_match = re.search(score_line_pattern, analysis_text, re.IGNORECASE | re.MULTILINE)
@@ -89,6 +147,7 @@ def extract_ats_score(analysis_text):
         }
 
 # Function to analyze edited resume and return new score
+@st.cache_data(ttl=1800, show_spinner=False)  # Cache for 30 minutes
 def analyze_edited_resume(edited_text, job_description, ats_model="Generic ATS", job_level="", job_role=""):
     # Get selected ATS system information
     selected_ats = ATS_SYSTEMS[ats_model]
@@ -137,24 +196,41 @@ def analyze_edited_resume(edited_text, job_description, ats_model="Generic ATS",
     Job level: {job_level}
     Job role: {job_role}
     """
-    response = model.generate_content([edited_text, prompt])
     try:
-        score_text = response.text.strip()
-        # Extract score using our improved function
-        score_result = extract_ats_score(score_text)
-        return score_result
+        with st.spinner("Calculating ATS score..."):
+            # Define the API call function
+            def api_call():
+                return model.generate_content([edited_text, prompt])
+
+            # Call with timeout (30 seconds)
+            try:
+                response = timeout_handler(30, api_call)
+                score_text = response.text.strip()
+                # Extract score using our improved function
+                score_result = extract_ats_score(score_text)
+                return score_result
+            except TimeoutException:
+                st.error("Score calculation is taking longer than expected. Please try again.")
+                return {"value": 0, "display": "Timed out"}
     except Exception as e:
+        st.error(f"Error calculating ATS score: {str(e)}")
         print(f"Error in analyze_edited_resume: {str(e)}")
         return {"value": 0, "display": "0/100"}
 
-# Function to read PDF
+# Function to read PDF with caching
+@st.cache_data(ttl=3600, show_spinner=False)  # Cache for 1 hour
 def read_pdf(uploaded_file):
     if uploaded_file is not None:
-        pdf_reader = PdfReader(uploaded_file)
-        pdf_text = ""
-        for page in pdf_reader.pages:
-            pdf_text += page.extract_text()
-        return pdf_text
+        try:
+            with st.spinner("Reading PDF..."):
+                pdf_reader = PdfReader(uploaded_file)
+                pdf_text = ""
+                for page in pdf_reader.pages:
+                    pdf_text += page.extract_text()
+                return pdf_text
+        except Exception as e:
+            st.error(f"Error reading PDF: {str(e)}")
+            raise e
     else:
         raise FileNotFoundError("No file uploaded")
 
@@ -416,8 +492,51 @@ Nice to Have:
 """
 }
 
+# Function to initialize and manage session state
+def initialize_session_state():
+    # Initialize session state variables if they don't exist
+    if 'analysis_response' not in st.session_state:
+        st.session_state.analysis_response = None
+    if 'original_score' not in st.session_state:
+        st.session_state.original_score = None
+    if 'current_score' not in st.session_state:
+        st.session_state.current_score = None
+    if 'pdf_text' not in st.session_state:
+        st.session_state.pdf_text = None
+    if 'job_description' not in st.session_state:
+        st.session_state.job_description = None
+    if 'edited_resume' not in st.session_state:
+        st.session_state.edited_resume = ""
+    if 'selected_ats' not in st.session_state:
+        st.session_state.selected_ats = "Generic ATS"
+    if 'job_level' not in st.session_state:
+        st.session_state.job_level = ""
+    if 'job_role' not in st.session_state:
+        st.session_state.job_role = ""
+    if 'app_version' not in st.session_state:
+        st.session_state.app_version = "1.1.0"  # Track app version for cache busting
+
+# Function to clear cache and reset session
+def reset_app():
+    # Clear all cached functions
+    st.cache_data.clear()
+
+    # Reset session state
+    for key in list(st.session_state.keys()):
+        if key != 'app_version':  # Keep the app version
+            del st.session_state[key]
+
+    # Re-initialize session state
+    initialize_session_state()
+
+    # Show success message
+    st.success("Application reset successfully! Cache cleared.")
+
 # Streamlit UI
 st.set_page_config(page_title="ATS-Checker - Powered by Gemini AI", layout="wide")
+
+# Initialize session state
+initialize_session_state()
 
 # Custom CSS for a ResumeWorded-like design with hidden header
 st.markdown("""
@@ -439,17 +558,17 @@ st.markdown("""
     }
 
     .main {
-        background-color: #f5f5f5;
+        background-color: #1e1e1e;
     }
     .stApp {
         max-width: 100%;
         margin: 0 auto;
     }
-    h1 {
-        color: #2e4057;
+    h1, h2, h3, h4, h5, h6 {
+        color: #f0f0f0;
     }
-    h2 {
-        color: #4d648d;
+    p {
+        color: #e0e0e0;
     }
     .stButton>button {
         background-color: #4d648d;
@@ -459,34 +578,69 @@ st.markdown("""
         font-weight: bold;
     }
     .stButton>button:hover {
-        background-color: #2e4057;
+        background-color: #5d749d;
     }
     .results {
-        background-color: white;
+        background-color: #2d2d2d;
         padding: 20px;
         border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        color: #333333 !important;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        color: #f0f0f0 !important;
         font-size: 16px;
         line-height: 1.6;
     }
+    /* Style for section headers like JOB DESCRIPTION ANALYSIS and ATS SCORE */
+    .results h1, .results h2, .results h3 {
+        color: #4d8dff !important;
+        font-weight: bold !important;
+        border-bottom: 1px solid #4d8dff !important;
+        padding-bottom: 5px !important;
+        margin-top: 20px !important;
+        margin-bottom: 15px !important;
+        font-size: 1.5rem !important;
+        font-family: sans-serif !important;
+        letter-spacing: normal !important;
+        line-height: 1.4 !important;
+        text-transform: uppercase !important;
+        background-color: transparent !important;
+        display: block !important;
+        width: 100% !important;
+    }
+
+    /* Override any Streamlit-specific styling for h2 elements */
+    .results h2[id], .results h2[level], .results h2[data-testid], .results h2 span {
+        color: #4d8dff !important;
+        font-weight: bold !important;
+        font-size: 1.5rem !important;
+        font-family: sans-serif !important;
+        letter-spacing: normal !important;
+        line-height: 1.4 !important;
+        text-transform: uppercase !important;
+    }
+
+    /* Remove any Streamlit-specific elements inside headers */
+    .results h2 span[data-testid="stHeaderActionElements"] {
+        display: none !important;
+    }
     /* Score styles removed */
     .score-improvement {
-        background-color: #e8f5e9;
-        color: #2e7d32;
+        background-color: #1e3a2d;
+        color: #4caf50;
         padding: 8px 16px;
         border-radius: 20px;
         font-weight: bold;
         display: inline-block;
         margin-top: 10px;
         text-align: center;
+        border: 1px solid #4caf50;
     }
     .issue-card {
-        background-color: white;
+        background-color: #2d2d2d;
         border-radius: 8px;
         padding: 20px;
         margin-bottom: 20px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        border: 1px solid #3d3d3d;
     }
     .issue-header {
         display: flex;
@@ -501,27 +655,30 @@ st.markdown("""
     .issue-title {
         font-size: 18px;
         font-weight: 600;
-        color: #333;
+        color: #f0f0f0;
     }
     .issue-count {
-        background-color: #f0f0f0;
+        background-color: #3d3d3d;
         padding: 4px 12px;
         border-radius: 12px;
         font-size: 14px;
         margin-left: 10px;
+        color: #e0e0e0;
     }
     .issue-content {
-        color: #555;
+        color: #d0d0d0;
         line-height: 1.5;
     }
     .highlight-text {
-        background-color: #fff9c4;
+        background-color: #3d3d1e;
         padding: 2px 4px;
+        color: #ffeb3b;
+        border-radius: 3px;
     }
     .suggestion-button {
-        background-color: #e3f2fd;
-        color: #1976d2;
-        border: none;
+        background-color: #1e3a4f;
+        color: #64b5f6;
+        border: 1px solid #64b5f6;
         padding: 8px 16px;
         border-radius: 4px;
         cursor: pointer;
@@ -529,9 +686,9 @@ st.markdown("""
         margin-top: 10px;
     }
     .fixed-button {
-        background-color: #f5f5f5;
-        color: #333;
-        border: 1px solid #ddd;
+        background-color: #2d2d2d;
+        color: #e0e0e0;
+        border: 1px solid #4d4d4d;
         padding: 8px 16px;
         border-radius: 4px;
         cursor: pointer;
@@ -539,30 +696,48 @@ st.markdown("""
         float: right;
     }
     .resume-editor {
-        border: 1px solid #ddd;
+        border: 1px solid #4d4d4d;
         border-radius: 8px;
         padding: 15px;
-        background-color: white;
+        background-color: #2d2d2d;
+    }
+    /* Make text areas and inputs match the dark theme */
+    textarea, input[type="text"], .stTextInput>div>div>input, .stSelectbox>div>div>div {
+        background-color: #2d2d2d !important;
+        color: #f0f0f0 !important;
+        border-color: #4d4d4d !important;
+    }
+    /* Style for code blocks */
+    code {
+        background-color: #2d2d2d;
+        color: #f0f0f0;
+        border: 1px solid #4d4d4d;
     }
     .nav-header {
-        background-color: #1a237e;
+        background-color: #121212;
         color: white;
         padding: 15px 20px;
         display: flex;
         justify-content: space-between;
         align-items: center;
         margin-bottom: 20px;
+        border-bottom: 2px solid #4d8dff;
     }
     .nav-title {
         font-weight: bold;
         font-size: 18px;
         letter-spacing: 1px;
+        color: #4d8dff;
     }
     .nav-subtitle {
-        opacity: 0.8;
+        opacity: 0.9;
+        color: #f0f0f0;
     }
     textarea {
         font-family: monospace;
+        background-color: #2d2d2d !important;
+        color: #f0f0f0 !important;
+        border: 1px solid #4d4d4d !important;
     }
     .stTabs [data-baseweb="tab-list"] {
         gap: 24px;
@@ -570,18 +745,30 @@ st.markdown("""
     .stTabs [data-baseweb="tab"] {
         height: 50px;
         white-space: pre-wrap;
-        background-color: #f0f2f6;
+        background-color: #2d2d2d;
         border-radius: 4px 4px 0px 0px;
         gap: 1px;
         padding-top: 10px;
         padding-bottom: 10px;
+        color: #e0e0e0;
     }
     .stTabs [aria-selected="true"] {
-        background-color: #4d648d;
+        background-color: #4d8dff;
         color: white;
     }
     .stProgress > div > div {
-        background-color: #f8a978;
+        background-color: #4d8dff;
+    }
+    /* Style for expanders */
+    .streamlit-expanderHeader {
+        background-color: #2d2d2d !important;
+        color: #f0f0f0 !important;
+        border-color: #4d4d4d !important;
+    }
+    .streamlit-expanderContent {
+        background-color: #2d2d2d !important;
+        color: #f0f0f0 !important;
+        border-color: #4d4d4d !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -600,6 +787,13 @@ st.markdown("### Upload your resume and select a job description to get started"
 # Create a 3-column layout: left sidebar for inputs and score, middle for analysis, right for editable resume
 # Adjusted proportions for better use of screen space
 left_col, middle_col, right_col = st.columns([1, 1.5, 1.5])
+
+# Add a reset button in the sidebar
+with st.sidebar:
+    st.markdown("### App Controls")
+    if st.button("Reset App & Clear Cache", help="Use this if the app is slow or not responding"):
+        reset_app()
+        st.rerun()
 
 with left_col:
     # File upload
@@ -629,9 +823,10 @@ with left_col:
         </div>
         """, unsafe_allow_html=True)
 
-        job_description = st.text_area("",
+        job_description = st.text_area("Job Description",
                                       placeholder="Paste the full job description here. Include all requirements, qualifications, and responsibilities for the most accurate analysis.",
-                                      height=200)
+                                      height=200,
+                                      label_visibility="collapsed")
 
         if job_description:
             # Show character count and quality indicator
@@ -711,38 +906,44 @@ with left_col:
                        - Education match (15%): Relevance of education to the position
 
                     ANALYSIS FORMAT:
-                    1. JOB DESCRIPTION ANALYSIS:
+                    1. <h2>JOB DESCRIPTION ANALYSIS</h2>
                        - Summarize the key requirements and qualifications from the job description
                        - List the most important keywords and phrases the ATS will scan for
                        - Identify any unique or specific requirements that stand out
 
-                    2. ATS SCORE: Provide a single, consistent score out of 100 with one decimal place precision
+                    2. <h2>ATS SCORE</h2> Provide a single, consistent score out of 100 with one decimal place precision
 
-                    3. KEY FINDINGS:
+                    3. <h2>KEY FINDINGS</h2>
                        - Identify the most important keywords found and missing in the resume
                        - Evaluate the resume structure and format for {ats_model} ATS compatibility
                        - Assess the overall match between the resume and job description
 
-                    4. {ats_model.upper()} SPECIFIC RECOMMENDATIONS:
+                    4. <h2>{ats_model.upper()} SPECIFIC RECOMMENDATIONS</h2>
                        - Provide specific advice for optimizing this resume for the {ats_model} ATS system
                        - Highlight any particular strengths or weaknesses for this specific ATS
                        - Explain how this specific ATS might evaluate certain aspects of the resume
 
-                    5. OPTIMIZATION SUGGESTIONS:
+                    5. <h2>OPTIMIZATION SUGGESTIONS</h2>
                        - List 5 specific, actionable recommendations to improve the resume for this job
                        - Suggest exact keywords to add and where to place them
                        - Recommend format changes to improve ATS readability
                        - Provide specific phrasing suggestions that align with the job description
 
-                    6. SECTION-BY-SECTION ANALYSIS:
+                    6. <h2>SECTION-BY-SECTION ANALYSIS</h2>
                        - Analyze each major section of the resume (Summary, Experience, Skills, Education)
                        - Provide specific improvement suggestions for each section
                        - Suggest how to better align each section with the job requirements
 
-                    7. ATS PASSING STRATEGY:
+                    7. <h2>ATS PASSING STRATEGY</h2>
                        - Provide a clear strategy for passing the {ats_model} ATS for this specific job
                        - Highlight the most critical changes needed to improve chances of getting through the ATS
                        - Suggest any industry-specific tactics that might help for this particular role
+
+                    IMPORTANT FORMATTING NOTES:
+                    - Use HTML <h2> tags for all section headers as shown above
+                    - Make sure all section headers have the same style and formatting
+                    - Use consistent styling throughout the analysis
+                    - Do not include any additional attributes in the h2 tags
 
                     Resume text: {pdf_text}
                     Job description: {job_description}
@@ -801,16 +1002,20 @@ if 'analysis_response' in st.session_state:
 
         # Display the exact score as it appears in the analysis
         score = st.session_state.current_score
-        st.markdown(f"### Current Score: {score['display']}", unsafe_allow_html=True)
+        if score is not None:
+            st.markdown(f"### Current Score: {score['display']}", unsafe_allow_html=True)
+        else:
+            st.markdown("### Current Score: Not available", unsafe_allow_html=True)
 
         # Score improvement if changes were made
-        if st.session_state.current_score['value'] > st.session_state.original_score['value']:
-            improvement = st.session_state.current_score['value'] - st.session_state.original_score['value']
-            st.markdown(f"""
-            <div class="score-improvement">
-                +{improvement:.1f} POINTS
-            </div>
-            """, unsafe_allow_html=True)
+        if score is not None and st.session_state.original_score is not None:
+            if score['value'] > st.session_state.original_score['value']:
+                improvement = score['value'] - st.session_state.original_score['value']
+                st.markdown(f"""
+                <div class="score-improvement">
+                    +{improvement:.1f} POINTS
+                </div>
+                """, unsafe_allow_html=True)
 
         # Extract issues from analysis
         analysis_text = st.session_state.analysis_response
@@ -821,14 +1026,20 @@ if 'analysis_response' in st.session_state:
         suggestions = []
 
         # Very basic extraction logic - in a real app this would be more robust
-        if "missing keywords" in analysis_text.lower():
-            missing_keywords = ["Add relevant keywords from job description"]
+        if analysis_text is not None:
+            if "missing keywords" in analysis_text.lower():
+                missing_keywords = ["Add relevant keywords from job description"]
 
-        if "format" in analysis_text.lower():
-            format_issues = ["Improve resume formatting for ATS"]
+            if "format" in analysis_text.lower():
+                format_issues = ["Improve resume formatting for ATS"]
 
-        if "suggest" in analysis_text.lower() or "recommendation" in analysis_text.lower():
-            suggestions = ["Implement suggested improvements"]
+            if "suggest" in analysis_text.lower() or "recommendation" in analysis_text.lower():
+                suggestions = ["Implement suggested improvements"]
+        else:
+            # Default suggestions when no analysis is available
+            missing_keywords = ["Upload resume to see missing keywords"]
+            format_issues = ["Upload resume to check format"]
+            suggestions = ["Upload resume to get suggestions"]
 
         # Navigation menu for issues (similar to ResumeWorded)
         st.markdown("## ISSUES")
@@ -849,11 +1060,55 @@ if 'analysis_response' in st.session_state:
         st.markdown("## Analysis Results")
 
         # Display the full analysis with proper formatting and colors
-        st.markdown(f'<div class="results" style="width: 100%; overflow-wrap: break-word;">{st.session_state.analysis_response}</div>', unsafe_allow_html=True)
+        # Process the analysis response to ensure consistent header styling
+        analysis_text = st.session_state.analysis_response
+
+        # Replace any h2 tags or markdown headers with our custom styled headers
+        if analysis_text:
+            # Replace markdown headers (## Header) with custom styled headers
+            import re
+            # Find all markdown headers and replace them with custom styled headers
+            analysis_text = re.sub(
+                r'## ([A-Z\s]+):?',
+                r'<h2 class="custom-header">\1</h2>',
+                analysis_text
+            )
+
+            # Replace any HTML h2 tags with our custom styled headers
+            analysis_text = re.sub(
+                r'<h2>([A-Z\s]+)</h2>',
+                r'<h2 class="custom-header">\1</h2>',
+                analysis_text
+            )
+
+        # Display the processed analysis
+        st.markdown(f'''
+        <div class="results" style="width: 100%; overflow-wrap: break-word;">
+            {analysis_text}
+        </div>
+        <style>
+            .custom-header {{
+                color: #4d8dff !important;
+                font-weight: bold !important;
+                border-bottom: 1px solid #4d8dff !important;
+                padding-bottom: 5px !important;
+                margin-top: 20px !important;
+                margin-bottom: 15px !important;
+                font-size: 1.5rem !important;
+                font-family: sans-serif !important;
+                text-transform: uppercase !important;
+                background-color: transparent !important;
+                display: block !important;
+                width: 100% !important;
+            }}
+        </style>
+        ''', unsafe_allow_html=True)
 
         # Option to chat about the resume
         st.markdown("### Have questions about your resume?")
-        user_question = st.text_input("Ask me anything about your resume or the analysis:")
+        user_question = st.text_input("Ask me anything about your resume or the analysis:",
+                                     placeholder="E.g., How can I improve my skills section?",
+                                     key="user_question")
 
         if user_question:
             with st.spinner("Generating response..."):
@@ -871,6 +1126,22 @@ if 'analysis_response' in st.session_state:
                 """
 
                 chat_response = get_gemini_output(st.session_state.pdf_text, chat_prompt)
+                # Process the chat response to ensure consistent header styling
+                if chat_response:
+                    # Replace markdown headers (## Header) with custom styled headers
+                    chat_response = re.sub(
+                        r'## ([A-Z\s]+):?',
+                        r'<h2 class="custom-header">\1</h2>',
+                        chat_response
+                    )
+
+                    # Replace any HTML h2 tags with our custom styled headers
+                    chat_response = re.sub(
+                        r'<h2>([A-Z\s]+)</h2>',
+                        r'<h2 class="custom-header">\1</h2>',
+                        chat_response
+                    )
+
                 st.markdown(f'<div class="results" style="width: 100%; overflow-wrap: break-word;">{chat_response}</div>', unsafe_allow_html=True)
 
     # Right column - Editable resume with live updates
@@ -880,10 +1151,19 @@ if 'analysis_response' in st.session_state:
 
         # Editable resume text area with ResumeWorded-like styling - using more space
         st.markdown('<div class="resume-editor" style="width: 100%;">', unsafe_allow_html=True)
-        edited_resume = st.text_area("",
-                                    value=st.session_state.edited_resume,
+
+        # Get the current value from session state, defaulting to empty string if None
+        current_resume_text = st.session_state.edited_resume if st.session_state.edited_resume is not None else ""
+
+        # Add a placeholder message if no resume is uploaded yet
+        placeholder = "Upload a resume to edit it here, or paste your resume text directly."
+
+        edited_resume = st.text_area("Edit Your Resume",
+                                    value=current_resume_text,
                                     height=500,  # Increased height
-                                    key="resume_editor")
+                                    placeholder=placeholder,
+                                    key="resume_editor",
+                                    label_visibility="collapsed")  # Hide the label but keep it for accessibility
         st.markdown('</div>', unsafe_allow_html=True)
 
         # Update the editable resume in session state
@@ -892,8 +1172,87 @@ if 'analysis_response' in st.session_state:
         # Button to analyze the updated resume
         if st.button("Update Score"):
             if edited_resume:
-                # Check if the resume has actually been edited
-                if edited_resume != st.session_state.pdf_text:
+                # Check if we have a job description
+                if st.session_state.job_description is None or st.session_state.job_description == "":
+                    st.error("Please enter a job description or select a template before updating the score.")
+                # Check if we have an original resume to compare against
+                elif st.session_state.pdf_text is None:
+                    # This is a direct entry without uploading a PDF first
+                    with st.spinner("Analyzing your resume..."):
+                        try:
+                            # Store the manually entered resume text
+                            st.session_state.pdf_text = edited_resume
+
+                            # Get selected ATS system information
+                            ats_model = st.session_state.selected_ats
+                            selected_ats = ATS_SYSTEMS[ats_model]
+
+                            # Use the same prompt as the initial analysis
+                            prompt = f"""
+                            You are ResumeChecker, an expert in ATS (Applicant Tracking System) analysis. Your task is to provide a comprehensive evaluation of the resume against the job description, specifically for the {ats_model} ATS system, and help the candidate pass the ATS screening process.
+
+                            ABOUT THE {ats_model.upper()} ATS SYSTEM:
+                            {selected_ats["description"]}
+
+                            KEY FEATURES:
+                            {', '.join(selected_ats["key_features"])}
+
+                            FORMAT PREFERENCES:
+                            {selected_ats["format_preferences"]}
+
+                            PARSING QUIRKS:
+                            {selected_ats["parsing_quirks"]}
+
+                            ANALYSIS FORMAT:
+                            1. <h2>JOB DESCRIPTION ANALYSIS</h2>
+                               - Summarize the key requirements and qualifications from the job description
+                               - List the most important keywords and phrases the ATS will scan for
+                               - Identify any unique or specific requirements that stand out
+
+                            2. <h2>ATS SCORE</h2> Provide a single, consistent score out of 100 with one decimal place precision
+
+                            3. <h2>KEY FINDINGS</h2>
+                               - Identify the most important keywords found and missing in the resume
+                               - Evaluate the resume structure and format for {ats_model} ATS compatibility
+                               - Assess the overall match between the resume and job description
+
+                            4. <h2>{ats_model.upper()} SPECIFIC RECOMMENDATIONS</h2>
+                               - Provide specific advice for optimizing this resume for the {ats_model} ATS system
+                               - Highlight any particular strengths or weaknesses for this specific ATS
+                               - Explain how this specific ATS might evaluate certain aspects of the resume
+
+                            5. <h2>OPTIMIZATION SUGGESTIONS</h2>
+                               - List 5 specific, actionable recommendations to improve the resume for this job
+                               - Suggest exact keywords to add and where to place them
+                               - Recommend format changes to improve ATS readability
+                               - Provide specific phrasing suggestions that align with the job description
+
+                            Resume text: {edited_resume}
+                            Job description: {st.session_state.job_description}
+                            Job level: {st.session_state.get('job_level', '')}
+                            Job role: {st.session_state.get('job_role', '')}
+                            """
+
+                            response = get_gemini_output(edited_resume, prompt)
+
+                            # Extract ATS score from the analysis
+                            original_score = extract_ats_score(response)
+
+                            # Store in session state
+                            st.session_state.analysis_response = response
+                            st.session_state.original_score = original_score
+                            st.session_state.current_score = original_score
+
+                            # Show success message
+                            st.success(f"Your resume received an ATS Score of {original_score['display']}")
+
+                            # Rerun to show the analysis
+                            st.rerun()
+
+                        except Exception as e:
+                            st.error(f"An error occurred: {str(e)}")
+                # Check if the resume has actually been edited compared to the original
+                elif edited_resume != st.session_state.pdf_text:
                     with st.spinner("Updating score..."):
                         # Get updated ATS analysis using the selected ATS model and job details
                         new_score = analyze_edited_resume(
@@ -908,14 +1267,17 @@ if 'analysis_response' in st.session_state:
                         st.session_state.current_score = new_score
 
                         # Show the exact score from analysis
-                        if new_score['value'] > st.session_state.original_score['value']:
-                            improvement = new_score['value'] - st.session_state.original_score['value']
-                            st.success(f"Your resume received an ATS Score of {new_score['display']} (improved by {improvement:.1f} points)")
-                        elif new_score['value'] < st.session_state.original_score['value']:
-                            decrease = st.session_state.original_score['value'] - new_score['value']
-                            st.error(f"Your resume received an ATS Score of {new_score['display']} (decreased by {decrease:.1f} points)")
+                        if st.session_state.original_score is not None:
+                            if new_score['value'] > st.session_state.original_score['value']:
+                                improvement = new_score['value'] - st.session_state.original_score['value']
+                                st.success(f"Your resume received an ATS Score of {new_score['display']} (improved by {improvement:.1f} points)")
+                            elif new_score['value'] < st.session_state.original_score['value']:
+                                decrease = st.session_state.original_score['value'] - new_score['value']
+                                st.error(f"Your resume received an ATS Score of {new_score['display']} (decreased by {decrease:.1f} points)")
+                            else:
+                                st.info(f"Your resume received an ATS Score of {new_score['display']} (unchanged)")
                         else:
-                            st.info(f"Your resume received an ATS Score of {new_score['display']} (unchanged)")
+                            st.success(f"Your resume received an ATS Score of {new_score['display']}")
                 else:
                     # No changes made, keep the original score
                     st.info("No changes detected in the resume. Score remains the same.")
@@ -927,21 +1289,21 @@ current_date = datetime.now().strftime('%Y %B')
 
 # Create a footer container with background
 st.markdown("""
-<div style="background-color: #f5f5f5; padding: 20px; margin-top: 30px; border-top: 1px solid #ddd; text-align: center; width: 100%;">
+<div style="background-color: #121212; padding: 20px; margin-top: 30px; border-top: 1px solid #3d3d3d; text-align: center; width: 100%;">
 """, unsafe_allow_html=True)
 
 # Main footer content
 st.markdown("""
 <div style="display: flex; justify-content: center; max-width: 1600px; margin: 0 auto 20px auto; flex-wrap: wrap; gap: 40px;">
     <div>
-        <h4 style="color: #333; margin-bottom: 10px;">ATS CHECKER</h4>
-        <p style="color: #666; font-size: 14px;">Optimize your resume for ATS systems</p>
+        <h4 style="color: #f0f0f0; margin-bottom: 10px;">ATS CHECKER</h4>
+        <p style="color: #b0b0b0; font-size: 14px;">Optimize your resume for ATS systems</p>
     </div>
     <div>
-        <h4 style="color: #333; margin-bottom: 10px;">RESOURCES</h4>
-        <p style="color: #666; font-size: 14px;">
-            <a href="https://career.io/career-advice/create-an-optimized-ats-resume" target="_blank" style="color: #4d648d; text-decoration: none;">ATS Guide</a> |
-            <a href="https://cdn-careerservices.fas.harvard.edu/wp-content/uploads/sites/161/2023/08/College-resume-and-cover-letter-4.pdf" target="_blank" style="color: #4d648d; text-decoration: none;">Resume Tips</a>
+        <h4 style="color: #f0f0f0; margin-bottom: 10px;">RESOURCES</h4>
+        <p style="color: #b0b0b0; font-size: 14px;">
+            <a href="https://career.io/career-advice/create-an-optimized-ats-resume" target="_blank" style="color: #4d8dff; text-decoration: none;">ATS Guide</a> |
+            <a href="https://cdn-careerservices.fas.harvard.edu/wp-content/uploads/sites/161/2023/08/College-resume-and-cover-letter-4.pdf" target="_blank" style="color: #4d8dff; text-decoration: none;">Resume Tips</a>
         </p>
     </div>
 </div>
@@ -949,24 +1311,24 @@ st.markdown("""
 
 # Developer section with footer
 st.markdown("---")
-st.markdown("<h4 style='text-align: center; color: #333; margin-bottom: 20px;'>DEVELOPED BY</h4>", unsafe_allow_html=True)
+st.markdown("<h4 style='text-align: center; color: #4d8dff; margin-bottom: 20px; font-weight: bold;'>DEVELOPED BY</h4>", unsafe_allow_html=True)
 
 # Developer 1
 col1, col2, col3 = st.columns([1, 2, 1])
 with col2:
     st.markdown("""
-    <div style="display: flex; align-items: center; background-color: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border: 1px solid #eee; margin: 0 auto 20px auto;">
-        <img src="https://github.com/thestarsahil.png" alt="Sahil" style="width: 70px; height: 70px; border-radius: 50%; margin-right: 15px; border: 3px solid #4d648d; object-fit: cover;">
+    <div style="display: flex; align-items: center; background-color: #2d2d2d; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); border: 1px solid #3d3d3d; margin: 0 auto 20px auto;">
+        <img src="https://github.com/thestarsahil.png" alt="Sahil" style="width: 70px; height: 70px; border-radius: 50%; margin-right: 15px; border: 3px solid #4d8dff; object-fit: cover;">
         <div>
-            <h4 style="margin: 0; color: #333; font-size: 18px;">Sahil Ali</h4>
-            <p style="margin: 5px 0 0; color: #666; font-size: 13px;">C++ Embedded Programmer</p>
-            <p style="margin: 5px 0 0; color: #777; font-size: 12px;">Computer Science Student</p>
-            <a href="https://github.com/thestarsahil" target="_blank" style="color: #4d648d; text-decoration: none; font-size: 12px; display: inline-block; margin-top: 5px;">GitHub Profile</a>
+            <h4 style="margin: 0; color: #f0f0f0; font-size: 18px;">Sahil Ali</h4>
+            <p style="margin: 5px 0 0; color: #d0d0d0; font-size: 13px;">C++ Embedded Programmer</p>
+            <p style="margin: 5px 0 0; color: #b0b0b0; font-size: 12px;">Computer Science Student</p>
+            <a href="https://github.com/thestarsahil" target="_blank" style="color: #4d8dff; text-decoration: none; font-size: 12px; display: inline-block; margin-top: 5px;">GitHub Profile</a>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
 # Footer
-st.markdown("<div style='text-align: center; color: #999; font-size: 12px; margin-top: 20px;'>Copyright " + current_date + " ATS-Checker | Made by Embedded Programmers Society</div>", unsafe_allow_html=True)
-# making 
+st.markdown("<div style='text-align: center; color: #b0b0b0; font-size: 12px; margin-top: 20px; padding: 10px; border-top: 1px solid #3d3d3d;'>Copyright " + current_date + " ATS-Checker | Made by Embedded Programmers Society</div>", unsafe_allow_html=True)
+# making
 #light way to use the app
