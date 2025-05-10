@@ -968,3 +968,5 @@ with col2:
 
 # Footer
 st.markdown("<div style='text-align: center; color: #999; font-size: 12px; margin-top: 20px;'>Copyright " + current_date + " ATS-Checker | Made by Embedded Programmers Society</div>", unsafe_allow_html=True)
+# making 
+#light way to use the app
