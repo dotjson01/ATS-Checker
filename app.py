@@ -1,5 +1,7 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 import google.generativeai as genai
 from PyPDF2 import PdfReader
@@ -19,25 +21,111 @@ def extract_ats_score(analysis_text):
     try:
         # Look for patterns like "ATS SCORE: 75.5" or "ATS Score: 75.5/100"
         import re
-        score_pattern = r"ATS\s+SCORE:?\s*(\d+\.?\d*)"
-        match = re.search(score_pattern, analysis_text, re.IGNORECASE)
-        if match:
-            return float(match.group(1))
-        return 0
-    except:
-        return 0
+
+        # First, look for the exact ATS SCORE line in the analysis
+        # This is the most reliable way to get the exact score as shown in the analysis
+        score_line_pattern = r"(?:^|\n)(?:.*?)ATS\s+SCORE:?\s*(.*?)(?:\n|$)"
+        score_line_match = re.search(score_line_pattern, analysis_text, re.IGNORECASE | re.MULTILINE)
+
+        if score_line_match:
+            # Extract the full score line as displayed in the analysis
+            score_line = score_line_match.group(1).strip()
+
+            # Try to extract just the number from this line
+            number_match = re.search(r"(\d+\.?\d*)", score_line)
+            if number_match:
+                score_value = float(number_match.group(1))
+                print(f"Found exact score: {score_value} from line: {score_line}")
+                # Store both the numeric value and the full text representation
+                return {
+                    "value": score_value,
+                    "display": score_line  # This preserves the exact format shown in the analysis
+                }
+
+        # If we couldn't find a specific ATS SCORE line, try more generic patterns
+        patterns = [
+            r"ATS\s+SCORE:?\s*(\d+\.?\d*)",  # ATS SCORE: 75.5
+            r"ATS\s+SCORE:?\s*(\d+\.?\d*)\/100",  # ATS SCORE: 75.5/100
+            r"SCORE:?\s*(\d+\.?\d*)",  # SCORE: 75.5
+            r"(\d+\.?\d*)/100",  # 75.5/100
+            r"^(\d+\.?\d*)$"  # Just a number like 75.5
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, analysis_text, re.IGNORECASE | re.MULTILINE)
+            if match:
+                score_value = float(match.group(1))
+                print(f"Found score: {score_value} using pattern: {pattern}")
+                return {
+                    "value": score_value,
+                    "display": f"{score_value}/100"  # Default display format
+                }
+
+        # If no pattern matches, try to find any number in the text
+        numbers = re.findall(r"(\d+\.?\d*)", analysis_text)
+        if numbers:
+            for num in numbers:
+                try:
+                    score_value = float(num)
+                    if 0 <= score_value <= 100:  # Ensure it's a valid score
+                        print(f"Found score from numbers: {score_value}")
+                        return {
+                            "value": score_value,
+                            "display": f"{score_value}/100"  # Default display format
+                        }
+                except Exception:
+                    continue
+
+        print("No score found in text:", analysis_text[:100])  # Print first 100 chars for debugging
+        return {
+            "value": 0,
+            "display": "0/100"  # Default when no score is found
+        }
+    except Exception as e:
+        print(f"Error extracting score: {str(e)}")
+        return {
+            "value": 0,
+            "display": "0/100"  # Default on error
+        }
 
 # Function to analyze edited resume and return new score
-def analyze_edited_resume(edited_text, job_description):
+def analyze_edited_resume(edited_text, job_description, ats_model="Generic ATS", job_level="", job_role=""):
+    # Get selected ATS system information
+    selected_ats = ATS_SYSTEMS[ats_model]
+
     prompt = f"""
     You are ResumeChecker, an expert in ATS (Applicant Tracking System) analysis.
-    Your task is to provide a consistent and accurate evaluation of the resume against the job description.
+    Your task is to provide a consistent and accurate evaluation of the resume against the job description,
+    specifically for the {ats_model} ATS system.
 
-    INSTRUCTIONS:
-    1. Use a deterministic scoring algorithm that will produce the same score for the same resume and job description every time.
-    2. Calculate the ATS score based on the following criteria with exact weights:
+    ABOUT THE {ats_model.upper()} ATS SYSTEM:
+    {selected_ats["description"]}
+
+    KEY FEATURES:
+    {', '.join(selected_ats["key_features"])}
+
+    FORMAT PREFERENCES:
+    {selected_ats["format_preferences"]}
+
+    PARSING QUIRKS:
+    {selected_ats["parsing_quirks"]}
+
+    ANALYSIS APPROACH:
+    1. First, thoroughly analyze the job description to identify:
+       - Required skills, qualifications, and experience
+       - Essential keywords and phrases the ATS will likely scan for
+       - Core responsibilities and expectations
+       - Industry-specific terminology and jargon
+
+    2. Then, analyze the resume to determine:
+       - How well it matches the job requirements
+       - Which critical keywords are present or missing
+       - If the format is optimized for {ats_model} ATS parsing
+       - Whether experience and qualifications align with the job
+
+    3. Calculate the ATS score based on the following criteria with exact weights:
        - Keyword match (40%): Presence of key skills, technologies, and qualifications from the job description
-       - Resume format (20%): Proper structure, section organization, and machine readability
+       - Resume format (20%): Proper structure, section organization, and machine readability specifically for {ats_model}
        - Experience relevance (25%): How well the experience matches the job requirements
        - Education match (15%): Relevance of education to the position
 
@@ -46,18 +134,18 @@ def analyze_edited_resume(edited_text, job_description):
 
     Resume text: {edited_text}
     Job description: {job_description}
+    Job level: {job_level}
+    Job role: {job_role}
     """
     response = model.generate_content([edited_text, prompt])
     try:
         score_text = response.text.strip()
-        # Try to extract just the number
-        import re
-        score_match = re.search(r"(\d+\.?\d*)", score_text)
-        if score_match:
-            return float(score_match.group(1))
-        return float(score_text)
-    except:
-        return 0
+        # Extract score using our improved function
+        score_result = extract_ats_score(score_text)
+        return score_result
+    except Exception as e:
+        print(f"Error in analyze_edited_resume: {str(e)}")
+        return {"value": 0, "display": "0/100"}
 
 # Function to read PDF
 def read_pdf(uploaded_file):
@@ -69,6 +157,80 @@ def read_pdf(uploaded_file):
         return pdf_text
     else:
         raise FileNotFoundError("No file uploaded")
+
+# ATS system information
+ATS_SYSTEMS = {
+    "Generic ATS": {
+        "description": "A standard ATS that uses keyword matching and basic resume parsing.",
+        "key_features": [
+            "Keyword matching",
+            "Basic resume parsing",
+            "Standard formatting requirements"
+        ],
+        "format_preferences": "Standard resume format with clear section headings (Summary, Experience, Skills, Education).",
+        "parsing_quirks": "May struggle with complex formatting, tables, and graphics."
+    },
+    "iCIMS": {
+        "description": "A comprehensive talent acquisition platform used by many large enterprises.",
+        "key_features": [
+            "Advanced keyword matching",
+            "Semantic search capabilities",
+            "Skills-based filtering"
+        ],
+        "format_preferences": "Clean formatting with standard section headers. Supports DOC, DOCX, PDF, RTF, and TXT formats.",
+        "parsing_quirks": "Better at parsing PDF files than some other systems. May have issues with headers/footers and complex tables."
+    },
+    "Greenhouse": {
+        "description": "A hiring software platform focused on structured hiring processes.",
+        "key_features": [
+            "Attribute-based candidate evaluation",
+            "Custom application questions",
+            "Collaborative hiring"
+        ],
+        "format_preferences": "Clean, simple formatting. Works well with standard chronological resumes.",
+        "parsing_quirks": "May miss information in non-standard sections. Handles PDF and Word documents well."
+    },
+    "Manatal": {
+        "description": "An AI-powered recruitment software with advanced candidate matching.",
+        "key_features": [
+            "AI-powered candidate matching",
+            "Social media enrichment",
+            "Multilingual support"
+        ],
+        "format_preferences": "Standard resume format with clear section delineation. Supports various file formats.",
+        "parsing_quirks": "AI capabilities help with understanding context, but may still struggle with highly creative formats."
+    },
+    "ClearCompany": {
+        "description": "A talent management platform with emphasis on company goals and culture fit.",
+        "key_features": [
+            "Goal alignment",
+            "Culture-based screening",
+            "Competency mapping"
+        ],
+        "format_preferences": "Traditional resume format with clear sections. Prefers chronological format.",
+        "parsing_quirks": "May prioritize experience descriptions that align with company values and goals."
+    },
+    "Bullhorn": {
+        "description": "A recruitment software popular with staffing and recruiting agencies.",
+        "key_features": [
+            "Candidate tracking",
+            "Resume parsing",
+            "Job matching"
+        ],
+        "format_preferences": "Standard resume formats. Handles various file types including PDF and Word.",
+        "parsing_quirks": "Strong at parsing contact information and work history, may struggle with skill categorization in non-standard formats."
+    },
+    "Transformify": {
+        "description": "A modern ATS with focus on diversity and inclusion in hiring.",
+        "key_features": [
+            "Blind recruitment options",
+            "Skills-based matching",
+            "Global talent pool"
+        ],
+        "format_preferences": "Clean, standard formatting. Supports skills-based and chronological formats.",
+        "parsing_quirks": "May place higher emphasis on skills and qualifications over chronological work history."
+    }
+}
 
 # Job description templates
 JOB_TEMPLATES = {
@@ -255,16 +417,32 @@ Nice to Have:
 }
 
 # Streamlit UI
-st.set_page_config(page_title="ATS-Checker", layout="wide")
+st.set_page_config(page_title="ATS-Checker - Powered by Gemini AI", layout="wide")
 
-# Custom CSS for a ResumeWorded-like design
+# Custom CSS for a ResumeWorded-like design with hidden header
 st.markdown("""
 <style>
+    /* Hide Streamlit header (Deploy button and menu) */
+    header {
+        display: none !important;
+    }
+
+    /* Hide Streamlit footer */
+    footer {
+        display: none !important;
+    }
+
+    /* Adjust padding to account for removed header */
+    .main .block-container {
+        padding-top: 2rem !important;
+        padding-bottom: 2rem !important;
+    }
+
     .main {
         background-color: #f5f5f5;
     }
     .stApp {
-        max-width: 1200px;
+        max-width: 100%;
         margin: 0 auto;
     }
     h1 {
@@ -288,48 +466,11 @@ st.markdown("""
         padding: 20px;
         border-radius: 10px;
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        color: #333333;
+        color: #333333 !important;
+        font-size: 16px;
+        line-height: 1.6;
     }
-    .score-circle {
-        width: 150px;
-        height: 150px;
-        border-radius: 50%;
-        background: white;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-        align-items: center;
-        margin: 0 auto;
-        box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        position: relative;
-    }
-    .score-circle::before {
-        content: '';
-        position: absolute;
-        top: -10px;
-        left: -10px;
-        right: -10px;
-        bottom: -10px;
-        border-radius: 50%;
-        border: 10px solid #f8a978;
-        border-top-color: #f8a978;
-        border-right-color: #f8a978;
-        border-bottom-color: #f8a978;
-        border-left-color: #f8a978;
-        clip-path: polygon(0 0, 100% 0, 100% 100%, 0 100%);
-        opacity: 0.7;
-    }
-    .score-number {
-        font-size: 48px;
-        font-weight: bold;
-        color: #333;
-    }
-    .score-label {
-        font-size: 14px;
-        color: #777;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
+    /* Score styles removed */
     .score-improvement {
         background-color: #e8f5e9;
         color: #2e7d32;
@@ -449,15 +590,16 @@ st.markdown("""
 st.markdown("""
 <div class="nav-header">
     <div class="nav-title">ATS CHECKER</div>
-    <div class="nav-subtitle">SCORE MY RESUME</div>
+    <div class="nav-subtitle">POWERED BY GEMINI AI</div>
 </div>
 """, unsafe_allow_html=True)
 
 # Main content - ResumeWorded style layout with side-by-side view
 st.markdown("### Upload your resume and select a job description to get started")
 
-# Create a 3-column layout: left sidebar for score, middle for analysis, right for editable resume
-left_col, middle_col, right_col = st.columns([1, 2, 2])
+# Create a 3-column layout: left sidebar for inputs and score, middle for analysis, right for editable resume
+# Adjusted proportions for better use of screen space
+left_col, middle_col, right_col = st.columns([1, 1.5, 1.5])
 
 with left_col:
     # File upload
@@ -477,14 +619,47 @@ with left_col:
         with st.expander("View Job Description"):
             st.write(job_description)
     else:
-        # Custom job description input
-        job_description = st.text_area("Enter the job description (optional)", height=150)
+        # Enhanced custom job description input
+        st.markdown("""
+        <div style="margin-bottom: 5px;">
+            <span style="font-weight: bold;">Enter Job Description</span>
+            <span style="font-size: 0.85em; color: #666; margin-left: 5px;">
+                (Paste the complete job posting for best results)
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        job_description = st.text_area("",
+                                      placeholder="Paste the full job description here. Include all requirements, qualifications, and responsibilities for the most accurate analysis.",
+                                      height=200)
+
+        if job_description:
+            # Show character count and quality indicator
+            char_count = len(job_description)
+            if char_count < 200:
+                st.warning(f"Job description is too short ({char_count} characters). For best results, paste the complete job posting.")
+            elif char_count < 500:
+                st.info(f"Job description length: {char_count} characters. More details will improve analysis accuracy.")
+            else:
+                st.success(f"Job description length: {char_count} characters. Good level of detail for accurate analysis.")
 
     # Job level selection
     job_level = st.selectbox("Select Job Level", ["Entry Level/Fresher", "Intermediate (2-5 years)", "Advanced (5+ years)"])
 
     # Job role selection
     job_role = st.selectbox("Select Job Role", ["Software Development Engineer", "Data Analyst/Scientist", "MERN Stack Developer", "Other"])
+
+    # ATS system focus selection (with clarification)
+    st.markdown("""
+    <div style="margin-bottom: 5px;">
+        <span style="font-weight: bold;">ATS System Focus</span>
+        <span style="font-size: 0.85em; color: #666; margin-left: 5px;">
+            (Analysis uses Gemini AI with specialized prompts for each ATS system)
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
+    ats_model = st.selectbox("", ["Generic ATS", "iCIMS", "Greenhouse", "Manatal", "ClearCompany", "Bullhorn", "Transformify"],
+                            help="Select which ATS system to focus on. The analysis will be tailored with specific knowledge about this system's preferences and behaviors.")
 
     # Analyze button
     if st.button("Analyze Resume"):
@@ -493,34 +668,86 @@ with left_col:
                 try:
                     pdf_text = read_pdf(upload_file)
 
-                    # Use a single, consistent prompt for ATS analysis
-                    prompt = f"""
-                    You are ResumeChecker, an expert in ATS (Applicant Tracking System) analysis. Your task is to provide a consistent and accurate evaluation of the resume against the job description.
+                    # Get selected ATS system information
+                    selected_ats = ATS_SYSTEMS[ats_model]
 
-                    INSTRUCTIONS:
-                    1. Use a deterministic scoring algorithm that will produce the same score for the same resume and job description every time.
-                    2. Calculate the ATS score based on the following criteria with exact weights:
+                    # Store selected ATS in session state
+                    st.session_state.selected_ats = ats_model
+
+                    # Use a tailored prompt for ATS analysis with specific ATS information and deep job description analysis
+                    prompt = f"""
+                    You are ResumeChecker, an expert in ATS (Applicant Tracking System) analysis. Your task is to provide a comprehensive evaluation of the resume against the job description, specifically for the {ats_model} ATS system, and help the candidate pass the ATS screening process.
+
+                    ABOUT THE {ats_model.upper()} ATS SYSTEM:
+                    {selected_ats["description"]}
+
+                    KEY FEATURES:
+                    {', '.join(selected_ats["key_features"])}
+
+                    FORMAT PREFERENCES:
+                    {selected_ats["format_preferences"]}
+
+                    PARSING QUIRKS:
+                    {selected_ats["parsing_quirks"]}
+
+                    ANALYSIS APPROACH:
+                    1. First, thoroughly analyze the job description to identify:
+                       - Required skills, qualifications, and experience
+                       - Essential keywords and phrases the ATS will likely scan for
+                       - Core responsibilities and expectations
+                       - Company values and culture indicators
+                       - Industry-specific terminology and jargon
+
+                    2. Then, analyze the resume to determine:
+                       - How well it matches the job requirements
+                       - Which critical keywords are present or missing
+                       - If the format is optimized for {ats_model} ATS parsing
+                       - Whether experience and qualifications align with the job
+
+                    3. Calculate the ATS score based on the following criteria with exact weights:
                        - Keyword match (40%): Presence of key skills, technologies, and qualifications from the job description
-                       - Resume format (20%): Proper structure, section organization, and machine readability
+                       - Resume format (20%): Proper structure, section organization, and machine readability specifically for {ats_model}
                        - Experience relevance (25%): How well the experience matches the job requirements
                        - Education match (15%): Relevance of education to the position
 
                     ANALYSIS FORMAT:
-                    1. ATS SCORE: Provide a single, consistent score out of 100 with one decimal place precision
-                    2. KEY FINDINGS:
+                    1. JOB DESCRIPTION ANALYSIS:
+                       - Summarize the key requirements and qualifications from the job description
+                       - List the most important keywords and phrases the ATS will scan for
+                       - Identify any unique or specific requirements that stand out
+
+                    2. ATS SCORE: Provide a single, consistent score out of 100 with one decimal place precision
+
+                    3. KEY FINDINGS:
                        - Identify the most important keywords found and missing in the resume
-                       - Evaluate the resume structure and format for ATS compatibility
+                       - Evaluate the resume structure and format for {ats_model} ATS compatibility
                        - Assess the overall match between the resume and job description
-                    3. OPTIMIZATION SUGGESTIONS:
+
+                    4. {ats_model.upper()} SPECIFIC RECOMMENDATIONS:
+                       - Provide specific advice for optimizing this resume for the {ats_model} ATS system
+                       - Highlight any particular strengths or weaknesses for this specific ATS
+                       - Explain how this specific ATS might evaluate certain aspects of the resume
+
+                    5. OPTIMIZATION SUGGESTIONS:
                        - List 5 specific, actionable recommendations to improve the resume for this job
                        - Suggest exact keywords to add and where to place them
                        - Recommend format changes to improve ATS readability
-                    4. SECTION-BY-SECTION ANALYSIS:
-                       - Briefly analyze each major section of the resume (Summary, Experience, Skills, Education)
+                       - Provide specific phrasing suggestions that align with the job description
+
+                    6. SECTION-BY-SECTION ANALYSIS:
+                       - Analyze each major section of the resume (Summary, Experience, Skills, Education)
                        - Provide specific improvement suggestions for each section
+                       - Suggest how to better align each section with the job requirements
+
+                    7. ATS PASSING STRATEGY:
+                       - Provide a clear strategy for passing the {ats_model} ATS for this specific job
+                       - Highlight the most critical changes needed to improve chances of getting through the ATS
+                       - Suggest any industry-specific tactics that might help for this particular role
 
                     Resume text: {pdf_text}
                     Job description: {job_description}
+                    Job level: {job_level}
+                    Job role: {job_role}
                     """
 
                     response = get_gemini_output(pdf_text, prompt)
@@ -534,10 +761,11 @@ with left_col:
                     st.session_state.current_score = original_score
                     st.session_state.pdf_text = pdf_text
                     st.session_state.job_description = job_description
+                    st.session_state.job_level = job_level
+                    st.session_state.job_role = job_role
 
-                    # Initialize editable resume if not already present
-                    if 'edited_resume' not in st.session_state:
-                        st.session_state.edited_resume = pdf_text
+                    # Always update the editable resume when a new file is uploaded
+                    st.session_state.edited_resume = pdf_text
 
                 except Exception as e:
                     st.error(f"An error occurred: {str(e)}")
@@ -550,21 +778,37 @@ if 'analysis_response' in st.session_state:
     with left_col:
         st.markdown("## ATS Score")
 
-        # Score circle with percentage
-        score = st.session_state.current_score
+        # Display selected ATS system focus
+        ats_model = st.session_state.selected_ats
         st.markdown(f"""
-        <div class="score-circle">
-            <div class="score-number">{int(score)}</div>
-            <div class="score-label">OVERALL</div>
+        <div>
+            <span style="font-weight: bold; font-size: 1.1em;">ATS System Focus: {ats_model}</span>
+            <span style="display: block; font-size: 0.85em; color: #666; margin-top: 3px;">
+                Analysis powered by Google's Gemini AI with specialized knowledge of this ATS system
+            </span>
         </div>
         """, unsafe_allow_html=True)
 
+        # Show ATS system description
+        with st.expander("About this ATS system"):
+            st.write(ATS_SYSTEMS[ats_model]["description"])
+            st.write("**Key Features:**")
+            for feature in ATS_SYSTEMS[ats_model]["key_features"]:
+                st.write(f"- {feature}")
+            st.write(f"**Format Preferences:** {ATS_SYSTEMS[ats_model]['format_preferences']}")
+            st.write("---")
+            st.write("**How this works:** Our AI analyzes your resume using specialized knowledge about this ATS system's preferences and behaviors. While we use Google's Gemini model for all analyses, the prompts and evaluation criteria are tailored specifically for each ATS system based on research and industry knowledge.")
+
+        # Display the exact score as it appears in the analysis
+        score = st.session_state.current_score
+        st.markdown(f"### Current Score: {score['display']}", unsafe_allow_html=True)
+
         # Score improvement if changes were made
-        if st.session_state.current_score > st.session_state.original_score:
-            improvement = st.session_state.current_score - st.session_state.original_score
+        if st.session_state.current_score['value'] > st.session_state.original_score['value']:
+            improvement = st.session_state.current_score['value'] - st.session_state.original_score['value']
             st.markdown(f"""
             <div class="score-improvement">
-                +{int(improvement)} POINTS
+                +{improvement:.1f} POINTS
             </div>
             """, unsafe_allow_html=True)
 
@@ -605,7 +849,7 @@ if 'analysis_response' in st.session_state:
         st.markdown("## Analysis Results")
 
         # Display the full analysis with proper formatting and colors
-        st.markdown(f'<div class="results">{st.session_state.analysis_response}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="results" style="width: 100%; overflow-wrap: break-word;">{st.session_state.analysis_response}</div>', unsafe_allow_html=True)
 
         # Option to chat about the resume
         st.markdown("### Have questions about your resume?")
@@ -627,18 +871,18 @@ if 'analysis_response' in st.session_state:
                 """
 
                 chat_response = get_gemini_output(st.session_state.pdf_text, chat_prompt)
-                st.markdown(f'<div class="results">{chat_response}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="results" style="width: 100%; overflow-wrap: break-word;">{chat_response}</div>', unsafe_allow_html=True)
 
     # Right column - Editable resume with live updates
     with right_col:
         st.markdown("## Edit Your Resume")
         st.markdown("Make changes to your resume based on the suggestions and see your score improve in real-time.")
 
-        # Editable resume text area with ResumeWorded-like styling
-        st.markdown('<div class="resume-editor">', unsafe_allow_html=True)
+        # Editable resume text area with ResumeWorded-like styling - using more space
+        st.markdown('<div class="resume-editor" style="width: 100%;">', unsafe_allow_html=True)
         edited_resume = st.text_area("",
                                     value=st.session_state.edited_resume,
-                                    height=400,
+                                    height=500,  # Increased height
                                     key="resume_editor")
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -648,41 +892,79 @@ if 'analysis_response' in st.session_state:
         # Button to analyze the updated resume
         if st.button("Update Score"):
             if edited_resume:
-                with st.spinner("Updating score..."):
-                    # Get updated ATS analysis
-                    new_score = analyze_edited_resume(edited_resume, st.session_state.job_description)
+                # Check if the resume has actually been edited
+                if edited_resume != st.session_state.pdf_text:
+                    with st.spinner("Updating score..."):
+                        # Get updated ATS analysis using the selected ATS model and job details
+                        new_score = analyze_edited_resume(
+                            edited_resume,
+                            st.session_state.job_description,
+                            st.session_state.selected_ats,
+                            job_level=st.session_state.get('job_level', ''),
+                            job_role=st.session_state.get('job_role', '')
+                        )
 
-                    # Update the score in session state
-                    st.session_state.current_score = new_score
+                        # Update the score in session state
+                        st.session_state.current_score = new_score
 
-                    # Show score improvement
-                    if new_score > st.session_state.original_score:
-                        improvement = new_score - st.session_state.original_score
-                        st.success(f"🎉 Your resume score improved by {improvement:.1f} points!")
-                    elif new_score < st.session_state.original_score:
-                        decrease = st.session_state.original_score - new_score
-                        st.error(f"⚠️ Your resume score decreased by {decrease:.1f} points. Try different changes.")
-                    else:
-                        st.info("Your score remains the same. Try implementing more suggestions.")
+                        # Show the exact score from analysis
+                        if new_score['value'] > st.session_state.original_score['value']:
+                            improvement = new_score['value'] - st.session_state.original_score['value']
+                            st.success(f"Your resume received an ATS Score of {new_score['display']} (improved by {improvement:.1f} points)")
+                        elif new_score['value'] < st.session_state.original_score['value']:
+                            decrease = st.session_state.original_score['value'] - new_score['value']
+                            st.error(f"Your resume received an ATS Score of {new_score['display']} (decreased by {decrease:.1f} points)")
+                        else:
+                            st.info(f"Your resume received an ATS Score of {new_score['display']} (unchanged)")
+                else:
+                    # No changes made, keep the original score
+                    st.info("No changes detected in the resume. Score remains the same.")
             else:
                 st.error("Resume text cannot be empty.")
 
-# Footer with ResumeWorded-like styling
+# Get current year and month
+current_date = datetime.now().strftime('%Y %B')
+
+# Create a footer container with background
 st.markdown("""
-<div style="background-color: #f5f5f5; padding: 20px; margin-top: 30px; border-top: 1px solid #ddd; text-align: center;">
-    <div style="display: flex; justify-content: space-between; max-width: 800px; margin: 0 auto;">
-        <div>
-            <h4 style="color: #333; margin-bottom: 10px;">ATS CHECKER</h4>
-            <p style="color: #666; font-size: 14px;">Optimize your resume for ATS systems</p>
-        </div>
-        <div>
-            <h4 style="color: #333; margin-bottom: 10px;">RESOURCES</h4>
-            <p style="color: #666; font-size: 14px;">
-                <a href="https://career.io/career-advice/create-an-optimized-ats-resume" target="_blank" style="color: #4d648d; text-decoration: none;">ATS Guide</a> |
-                <a href="https://cdn-careerservices.fas.harvard.edu/wp-content/uploads/sites/161/2023/08/College-resume-and-cover-letter-4.pdf" target="_blank" style="color: #4d648d; text-decoration: none;">Resume Tips</a>
-            </p>
-        </div>
+<div style="background-color: #f5f5f5; padding: 20px; margin-top: 30px; border-top: 1px solid #ddd; text-align: center; width: 100%;">
+""", unsafe_allow_html=True)
+
+# Main footer content
+st.markdown("""
+<div style="display: flex; justify-content: center; max-width: 1600px; margin: 0 auto 20px auto; flex-wrap: wrap; gap: 40px;">
+    <div>
+        <h4 style="color: #333; margin-bottom: 10px;">ATS CHECKER</h4>
+        <p style="color: #666; font-size: 14px;">Optimize your resume for ATS systems</p>
     </div>
-    <p style="color: #999; font-size: 12px; margin-top: 20px;">© 2024 ATS-Checker | Made with ❤️ to help job seekers</p>
+    <div>
+        <h4 style="color: #333; margin-bottom: 10px;">RESOURCES</h4>
+        <p style="color: #666; font-size: 14px;">
+            <a href="https://career.io/career-advice/create-an-optimized-ats-resume" target="_blank" style="color: #4d648d; text-decoration: none;">ATS Guide</a> |
+            <a href="https://cdn-careerservices.fas.harvard.edu/wp-content/uploads/sites/161/2023/08/College-resume-and-cover-letter-4.pdf" target="_blank" style="color: #4d648d; text-decoration: none;">Resume Tips</a>
+        </p>
+    </div>
 </div>
 """, unsafe_allow_html=True)
+
+# Developer section with footer
+st.markdown("---")
+st.markdown("<h4 style='text-align: center; color: #333; margin-bottom: 20px;'>DEVELOPED BY</h4>", unsafe_allow_html=True)
+
+# Developer 1
+col1, col2, col3 = st.columns([1, 2, 1])
+with col2:
+    st.markdown("""
+    <div style="display: flex; align-items: center; background-color: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border: 1px solid #eee; margin: 0 auto 20px auto;">
+        <img src="https://github.com/thestarsahil.png" alt="Sahil" style="width: 70px; height: 70px; border-radius: 50%; margin-right: 15px; border: 3px solid #4d648d; object-fit: cover;">
+        <div>
+            <h4 style="margin: 0; color: #333; font-size: 18px;">Sahil Ali</h4>
+            <p style="margin: 5px 0 0; color: #666; font-size: 13px;">C++ Embedded Programmer</p>
+            <p style="margin: 5px 0 0; color: #777; font-size: 12px;">Computer Science Student</p>
+            <a href="https://github.com/thestarsahil" target="_blank" style="color: #4d648d; text-decoration: none; font-size: 12px; display: inline-block; margin-top: 5px;">GitHub Profile</a>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Footer
+st.markdown("<div style='text-align: center; color: #999; font-size: 12px; margin-top: 20px;'>Copyright " + current_date + " ATS-Checker | Made by Embedded Programmers Society</div>", unsafe_allow_html=True)
