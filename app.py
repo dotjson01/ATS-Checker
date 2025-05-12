@@ -1322,7 +1322,7 @@ with col2:
         <div>
             <h4 style="margin: 0; color: #f0f0f0; font-size: 18px;">Sahil Ali</h4>
             <p style="margin: 5px 0 0; color: #d0d0d0; font-size: 13px;">C++ Embedded Programmer</p>
-            <p style="margin: 5px 0 0; color: #b0b0b0; font-size: 12px;">Computer Science Student</p>
+            <p style="margin: 5px 0 0; color: #b0b0b0; font-size: 12px;">Computer Science Engineer</p>
             <a href="https://github.com/thestarsahil" target="_blank" style="color: #4d8dff; text-decoration: none; font-size: 12px; display: inline-block; margin-top: 5px;">GitHub Profile</a>
         </div>
     </div>
