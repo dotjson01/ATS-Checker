@@ -1329,6 +1329,6 @@ with col2:
     """, unsafe_allow_html=True)
 
 # Footer
-st.markdown("<div style='text-align: center; color: #b0b0b0; font-size: 12px; margin-top: 20px; padding: 10px; border-top: 1px solid #3d3d3d;'>Copyright " + current_date + " ATS-Checker | Made by Embedded Programmers Society</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align: center; color: #b0b0b0; font-size: 12px; margin-top: 20px; padding: 10px; border-top: 1px solid #3d3d3d;'>Copyright " + current_date + " ATS-Checker | Created with Linux Community </div>", unsafe_allow_html=True)
 # making
 #light way to use the app
